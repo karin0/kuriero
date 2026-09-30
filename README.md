@@ -17,5 +17,4 @@ bot talking to a local Bot API server over plain HTTP builds without it.
 
 ## Checks
 
-`./check.sh` runs shellcheck, formatting, clippy with and without `rustls`, and the
-tests.
+See `./check.sh`.
