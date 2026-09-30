@@ -6,9 +6,10 @@ A blocking client for the Telegram Bot API. Kuriero is Esperanto for courier.
 the type the method names. `Client::request` takes any body ureq can send, such as a
 multipart upload. A call Telegram refuses with a rate limit or a failure of
 its own is made again, up to three attempts, after the wait Telegram names or a
-doubling backoff. Every other refusal ends the call at once as `Error::Rejected`.
-A retry can send a message twice when the answer to the first attempt was lost, so a
-method that sends a message reads its answer as `Sent`, the message id alone.
+doubling backoff. Every other refusal ends the call at once as `Error::Rejected`, and
+an answer that arrives but does not read as the method's type ends it as
+`Error::Unreadable`, since Telegram has already carried the call out. A retry can send
+a message twice when the answer to the first attempt was lost.
 
 `Client::get_updates` polls for messages and button presses.
 
