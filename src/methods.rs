@@ -3,7 +3,7 @@
 use std::ops::Not;
 
 use serde::Serialize;
-use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::de::DeserializeOwned;
 
 use crate::{Keyboard, Sent, User};
 
@@ -26,8 +26,7 @@ method!(GetMe, "getMe", User);
 method!(SetMyCommands<'_>, "setMyCommands", bool);
 method!(SendMessage<'_>, "sendMessage", Sent);
 method!(SendRichMessage<'_>, "sendRichMessage", Sent);
-// The result is the edited message, which no caller reads.
-method!(EditMessageText<'_>, "editMessageText", IgnoredAny);
+method!(EditMessageText<'_>, "editMessageText", Sent);
 method!(DeleteMessage, "deleteMessage", bool);
 method!(SetMessageReaction<'_>, "setMessageReaction", bool);
 method!(AnswerCallbackQuery<'_>, "answerCallbackQuery", bool);
