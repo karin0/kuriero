@@ -31,6 +31,8 @@ pub enum Error {
     Rejected { code: u16, description: String },
     /// The request or its answer never made it across, with the bot token masked.
     Transport(String),
+    /// Telegram carried the call out, and its answer does not read as the method's type.
+    Unreadable(serde_json::Error),
 }
 
 impl fmt::Display for Error {
@@ -38,6 +40,7 @@ impl fmt::Display for Error {
         match self {
             Self::Rejected { code, description } => write!(f, "{code} {description}"),
             Self::Transport(detail) => f.write_str(detail),
+            Self::Unreadable(error) => write!(f, "unreadable result: {error}"),
         }
     }
 }
@@ -110,8 +113,9 @@ impl Client {
     /// # Errors
     ///
     /// [`Error::Rejected`] for a request Telegram refused and would refuse again, or
-    /// still refused on the last attempt, and [`Error::Transport`] for a request or an
-    /// answer that never made it across on the last attempt.
+    /// still refused on the last attempt, [`Error::Transport`] for a request or an
+    /// answer that never made it across on the last attempt, and [`Error::Unreadable`]
+    /// for a call Telegram carried out whose answer does not read as `R`.
     pub fn request<R: DeserializeOwned>(
         &self,
         method: &str,
@@ -129,17 +133,21 @@ impl Client {
                 .config()
                 .timeout_global(Some(timeout))
                 .build();
-            let (error, wait) = match send(request)
-                .and_then(|mut response| response.body_mut().read_json::<Answer<R>>())
-            {
-                Ok(Answer {
-                    result: Some(result),
-                    ..
-                }) => return Ok(result),
-                Ok(answer) => {
-                    let wait = retry_after(&answer, attempt);
+            let (error, wait) = match send(request).and_then(|mut response| {
+                let status = response.status().as_u16();
+                Ok((status, response.body_mut().read_to_string()?))
+            }) {
+                Ok((200..300, body)) => {
+                    return serde_json::from_str::<Answer>(&body)
+                        .and_then(|answer| serde_json::from_value(answer.result))
+                        .map_err(Error::Unreadable);
+                }
+                Ok((code, body)) => {
+                    // A proxy in front of Telegram can answer with a page of its own.
+                    let answer: Answer = serde_json::from_str(&body).unwrap_or_default();
+                    let wait = retry_after(code, &answer, attempt);
                     let error = Error::Rejected {
-                        code: answer.error_code.unwrap_or_default(),
+                        code,
                         description: answer.description.unwrap_or_default(),
                     };
                     (error, wait)
@@ -162,12 +170,12 @@ impl Client {
     }
 }
 
-/// Telegram's answer to a call, which on a rejection names its code and, for a burst,
+/// Telegram's answer to a call, which on a rejection gives its reason and, for a burst,
 /// the wait it wants.
-#[derive(Deserialize)]
-struct Answer<R> {
-    result: Option<R>,
-    error_code: Option<u16>,
+#[derive(Default, Deserialize)]
+struct Answer {
+    #[serde(default)]
+    result: Value,
     description: Option<String>,
     parameters: Option<Parameters>,
 }
@@ -180,8 +188,8 @@ struct Parameters {
 /// How long before asking again, for a rejection that asking again can answer
 /// differently: a burst Telegram wants slowed down, which names the wait it wants, or a
 /// failure on its own side.
-fn retry_after<R>(answer: &Answer<R>, attempt: u32) -> Option<Duration> {
-    match answer.error_code? {
+fn retry_after(code: u16, answer: &Answer, attempt: u32) -> Option<Duration> {
+    match code {
         429 => Some(
             answer
                 .parameters
@@ -200,8 +208,8 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 /// The id of a message a call sent. A call that sends a message reads its answer as
-/// this alone, since an answer that fails to read is asked for again and the message
-/// would be sent twice.
+/// this alone, so a message that went out never fails its call over a field the crate
+/// cannot read.
 #[derive(Debug, Deserialize)]
 pub struct Sent {
     #[serde(rename = "message_id")]
@@ -384,13 +392,14 @@ mod tests {
         assert!(update.message.is_none());
     }
 
-    /// A server that gives each connection the next of `answers` and counts them.
-    fn server(answers: &'static [&'static str]) -> (String, std::thread::JoinHandle<usize>) {
+    /// A server that gives each connection the next of `answers`, a status and a body,
+    /// and counts them.
+    fn server(answers: &'static [(u16, &'static str)]) -> (String, std::thread::JoinHandle<usize>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("an address"));
         let served = std::thread::spawn(move || {
-            for (count, answer) in answers.iter().enumerate() {
+            for (count, (status, answer)) in answers.iter().enumerate() {
                 let (mut stream, _) = listener.accept().expect("accept");
                 // Closing with part of the request unread resets the connection, so the
                 // whole request is read before the answer.
@@ -402,7 +411,7 @@ mod tests {
                 }
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{answer}",
+                    "HTTP/1.1 {status} Answer\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{answer}",
                     answer.len()
                 )
                 .expect("an answer");
@@ -435,8 +444,11 @@ mod tests {
     #[test]
     fn a_burst_is_asked_about_again_after_the_wait_telegram_names() {
         let (base, served) = server(&[
-            r#"{"ok": false, "error_code": 429, "description": "slow down", "parameters": {"retry_after": 0}}"#,
-            r#"{"ok": true, "result": true}"#,
+            (
+                429,
+                r#"{"ok": false, "error_code": 429, "description": "slow down", "parameters": {"retry_after": 0}}"#,
+            ),
+            (200, r#"{"ok": true, "result": true}"#),
         ]);
         let client = Client::new(&base, "123:secret");
         assert!(
@@ -452,9 +464,10 @@ mod tests {
 
     #[test]
     fn a_refused_request_is_asked_once() {
-        let (base, served) = server(&[
+        let (base, served) = server(&[(
+            400,
             r#"{"ok": false, "error_code": 400, "description": "Bad Request: message to delete not found"}"#,
-        ]);
+        )]);
         let client = Client::new(&base, "123:secret");
         let error = client
             .send(&DeleteMessage {
@@ -470,6 +483,35 @@ mod tests {
     }
 
     #[test]
+    fn a_page_of_a_proxy_is_judged_by_its_status() {
+        let (base, served) = server(&[
+            (502, "<html>Bad Gateway</html>"),
+            (200, r#"{"ok": true, "result": true}"#),
+        ]);
+        let client = Client::new(&base, "123:secret");
+        assert!(
+            client
+                .send(&DeleteMessage {
+                    chat_id: 1,
+                    message_id: 2,
+                })
+                .expect("a result")
+        );
+        assert_eq!(served.join().expect("the server"), 2);
+    }
+
+    #[test]
+    fn a_call_carried_out_is_asked_once_even_when_its_result_does_not_read() {
+        let (base, served) = server(&[(200, r#"{"ok": true, "result": {"message_id": "one"}}"#)]);
+        let client = Client::new(&base, "123:secret");
+        let error = client
+            .send(&SendMessage::new(1, None, "hi"))
+            .expect_err("an unreadable result");
+        assert!(matches!(error, Error::Unreadable(_)));
+        assert_eq!(served.join().expect("the server"), 1);
+    }
+
+    #[test]
     fn a_transport_error_keeps_the_token_out_of_its_message() {
         let client = Client::new("http://bad host", "123:secret");
         let error = client.send(&GetMe).expect_err("an unreachable server");
@@ -479,24 +521,17 @@ mod tests {
 
     #[test]
     fn a_rejection_is_asked_about_again_only_when_the_answer_can_differ() {
-        let rejection = |answer: Value| {
-            let answer: Answer<bool> = serde_json::from_value(answer).expect("an answer");
-            retry_after(&answer, 1)
+        let rejection = |code, answer: Value| {
+            let answer: Answer = serde_json::from_value(answer).expect("an answer");
+            retry_after(code, &answer, 1)
         };
         assert_eq!(
-            rejection(json!({"ok": false, "error_code": 429, "parameters": {"retry_after": 7}})),
+            rejection(429, json!({"parameters": {"retry_after": 7}})),
             Some(Duration::from_secs(7))
         );
-        assert_eq!(
-            rejection(json!({"ok": false, "error_code": 429})),
-            Some(BACKOFF)
-        );
-        assert_eq!(
-            rejection(json!({"ok": false, "error_code": 502})),
-            Some(BACKOFF)
-        );
-        assert_eq!(rejection(json!({"ok": false, "error_code": 400})), None);
-        assert_eq!(rejection(json!({"ok": false})), None);
+        assert_eq!(rejection(429, json!({})), Some(BACKOFF));
+        assert_eq!(rejection(502, json!({})), Some(BACKOFF));
+        assert_eq!(rejection(400, json!({})), None);
         assert_eq!(backoff(3), BACKOFF * 4);
     }
 }
