@@ -7,6 +7,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+mod methods;
+pub use methods::*;
+
 /// How long one attempt at a call may take, on top of the wait a poll names.
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// A rejection Telegram would answer the same way stands, and the rest are worth asking
@@ -56,17 +59,13 @@ impl Client {
         }
     }
 
-    /// Calls `method` with a JSON body.
+    /// Calls the method `body` is for.
     ///
     /// # Errors
     ///
     /// Fails as [`Client::request`] does.
-    pub fn call<R: DeserializeOwned>(
-        &self,
-        method: &str,
-        body: &impl Serialize,
-    ) -> Result<R, Error> {
-        self.request(method, TIMEOUT, |request| request.send_json(body))
+    pub fn send<M: Method>(&self, body: &M) -> Result<M::Response, Error> {
+        self.request(M::NAME, TIMEOUT, |request| request.send_json(body))
     }
 
     /// One long poll for the messages and button presses since `offset`, which Telegram
@@ -442,7 +441,10 @@ mod tests {
         let client = Client::new(&base, "123:secret");
         assert!(
             client
-                .call::<bool>("deleteMessage", &json!({}))
+                .send(&DeleteMessage {
+                    chat_id: 1,
+                    message_id: 2,
+                })
                 .expect("a result")
         );
         assert_eq!(served.join().expect("the server"), 2);
@@ -451,15 +453,18 @@ mod tests {
     #[test]
     fn a_refused_request_is_asked_once() {
         let (base, served) = server(&[
-            r#"{"ok": false, "error_code": 400, "description": "Bad Request: message is not modified"}"#,
+            r#"{"ok": false, "error_code": 400, "description": "Bad Request: message to delete not found"}"#,
         ]);
         let client = Client::new(&base, "123:secret");
         let error = client
-            .call::<bool>("editMessageText", &json!({}))
+            .send(&DeleteMessage {
+                chat_id: 1,
+                message_id: 2,
+            })
             .expect_err("a rejection");
         assert!(matches!(
             error,
-            Error::Rejected { code: 400, ref description } if description.contains("not modified")
+            Error::Rejected { code: 400, ref description } if description.contains("not found")
         ));
         assert_eq!(served.join().expect("the server"), 1);
     }
@@ -467,9 +472,7 @@ mod tests {
     #[test]
     fn a_transport_error_keeps_the_token_out_of_its_message() {
         let client = Client::new("http://bad host", "123:secret");
-        let error = client
-            .call::<bool>("getMe", &json!({}))
-            .expect_err("an unreachable server");
+        let error = client.send(&GetMe).expect_err("an unreachable server");
         assert!(matches!(error, Error::Transport(_)));
         assert!(!error.to_string().contains("secret"), "{error}");
     }
