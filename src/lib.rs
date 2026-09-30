@@ -207,9 +207,9 @@ fn backoff(attempt: u32) -> Duration {
     BACKOFF * 2u32.pow(attempt - 1)
 }
 
-/// The id of a message a call sent. A call that sends a message reads its answer as
-/// this alone, so a message that went out never fails its call over a field the crate
-/// cannot read.
+/// The id of a message a call sent or edited. A call that sends or edits a message reads
+/// its answer as this alone, so a change that went out never fails its call over a
+/// field the crate cannot read.
 #[derive(Debug, Deserialize)]
 pub struct Sent {
     #[serde(rename = "message_id")]
