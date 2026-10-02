@@ -30,6 +30,7 @@ method!(EditMessageText<'_>, "editMessageText", Sent);
 method!(DeleteMessage, "deleteMessage", bool);
 method!(SetMessageReaction<'_>, "setMessageReaction", bool);
 method!(AnswerCallbackQuery<'_>, "answerCallbackQuery", bool);
+method!(SendChatAction, "sendChatAction", bool);
 
 #[derive(Serialize)]
 pub struct GetMe;
@@ -158,6 +159,21 @@ pub struct AnswerCallbackQuery<'a> {
     pub callback_query_id: &'a str,
 }
 
+/// Telegram shows the action for five seconds, or until the bot's next message arrives.
+#[derive(Serialize)]
+pub struct SendChatAction {
+    pub chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_thread_id: Option<i64>,
+    pub action: ChatAction,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAction {
+    Typing,
+}
+
 #[derive(Clone, Copy, Serialize)]
 pub enum ParseMode {
     #[serde(rename = "HTML")]
@@ -225,6 +241,15 @@ mod tests {
                 "parse_mode": "HTML",
                 "disable_notification": true,
             })
+        );
+        let action = SendChatAction {
+            chat_id: 7,
+            message_thread_id: Some(77),
+            action: ChatAction::Typing,
+        };
+        assert_eq!(
+            serde_json::to_value(&action).expect("a body"),
+            json!({"chat_id": 7, "message_thread_id": 77, "action": "typing"})
         );
         let scope = CommandScope::ChatMember {
             chat_id: -1,
