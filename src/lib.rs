@@ -17,6 +17,9 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// first was lost.
 const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_secs(1);
+/// The longest wait a burst may name and still be asked about again. A longer one ends
+/// the call, so the caller decides what to do rather than blocking for minutes.
+const LONGEST_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Client {
     base: String,
@@ -186,17 +189,18 @@ struct Parameters {
 }
 
 /// How long before asking again, for a rejection that asking again can answer
-/// differently: a burst Telegram wants slowed down, which names the wait it wants, or a
-/// failure on its own side.
+/// differently: a burst Telegram wants slowed down, which names the wait it wants, up
+/// to `LONGEST_WAIT`, or a failure on its own side.
 fn retry_after(code: u16, answer: &Answer, attempt: u32) -> Option<Duration> {
     match code {
-        429 => Some(
-            answer
-                .parameters
-                .as_ref()
-                .and_then(|parameters| parameters.retry_after)
-                .map_or_else(|| backoff(attempt), Duration::from_secs),
-        ),
+        429 => answer
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.retry_after)
+            .map_or_else(
+                || Some(backoff(attempt)),
+                |seconds| Some(Duration::from_secs(seconds)).filter(|wait| *wait <= LONGEST_WAIT),
+            ),
         500..600 => Some(backoff(attempt)),
         _ => None,
     }
@@ -463,6 +467,23 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_naming_a_wait_past_the_longest_is_handed_to_the_caller() {
+        let (base, served) = server(&[(
+            429,
+            r#"{"ok": false, "error_code": 429, "description": "slow down", "parameters": {"retry_after": 600}}"#,
+        )]);
+        let client = Client::new(&base, "123:secret");
+        let error = client
+            .send(&DeleteMessage {
+                chat_id: 1,
+                message_id: 2,
+            })
+            .expect_err("a rejection");
+        assert!(matches!(error, Error::Rejected { code: 429, .. }));
+        assert_eq!(served.join().expect("the server"), 1);
+    }
+
+    #[test]
     fn a_refused_request_is_asked_once() {
         let (base, served) = server(&[(
             400,
@@ -528,6 +549,10 @@ mod tests {
         assert_eq!(
             rejection(429, json!({"parameters": {"retry_after": 7}})),
             Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            rejection(429, json!({"parameters": {"retry_after": 31}})),
+            None
         );
         assert_eq!(rejection(429, json!({})), Some(BACKOFF));
         assert_eq!(rejection(502, json!({})), Some(BACKOFF));
