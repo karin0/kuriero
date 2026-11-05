@@ -214,6 +214,9 @@ pub enum ReplyMarkup<'a> {
         force_reply: bool,
         input_field_placeholder: &'a str,
     },
+    RemoveKeyboard {
+        remove_keyboard: bool,
+    },
 }
 
 #[cfg(test)]
