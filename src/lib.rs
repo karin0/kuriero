@@ -220,6 +220,13 @@ pub struct Sent {
     pub id: i64,
 }
 
+/// A topic a call created, read as the id that messages sent to it name.
+#[derive(Debug, Deserialize)]
+pub struct ForumTopic {
+    #[serde(rename = "message_thread_id")]
+    pub id: i64,
+}
+
 /// One update of a poll. A message or a press that does not read as the types below is
 /// logged and left out, so the update still moves the poll past it.
 #[derive(Debug, Deserialize)]
