@@ -14,6 +14,11 @@ a message twice when the answer to the first attempt was lost.
 
 `Client::get_updates` polls for messages and button presses.
 
+`Client::download` saves the file at a path `getFile` gave. A local Bot API server
+(`--local`) gives the absolute path of the file on its own filesystem, which the client
+copies, so that path has to be readable on the machine running the client. Telegram
+gives a path the client downloads, retried as a call is.
+
 The `rustls` feature, on by default, lets the client reach an `https` API server. A
 bot talking to a local Bot API server over plain HTTP builds without it.
 

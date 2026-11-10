@@ -1,6 +1,9 @@
 //! A blocking client for the Telegram Bot API, with the types of the updates it polls.
 
 use std::fmt;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -12,6 +15,9 @@ pub use methods::*;
 
 /// How long one attempt at a call may take, on top of the wait a poll names.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one attempt at a download may take, which covers Telegram's largest file of
+/// 20 MB at 1 Mbit/s.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// A rejection Telegram would answer the same way stands, and the rest are worth asking
 /// about again this many times. A retry can post a message twice when the answer to the
 /// first was lost.
@@ -36,6 +42,8 @@ pub enum Error {
     Transport(String),
     /// Telegram carried the call out, and its answer does not read as the method's type.
     Unreadable(serde_json::Error),
+    /// A file on this machine could not be read or written.
+    Io(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -44,6 +52,7 @@ impl fmt::Display for Error {
             Self::Rejected { code, description } => write!(f, "{code} {description}"),
             Self::Transport(detail) => f.write_str(detail),
             Self::Unreadable(error) => write!(f, "unreadable result: {error}"),
+            Self::Io(error) => write!(f, "{error}"),
         }
     }
 }
@@ -128,49 +137,112 @@ impl Client {
         ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<R, Error> {
         let url = format!("{}/bot{}/{method}", self.base, self.token);
-        let mut attempt = 1;
-        loop {
+        retried(method, |attempt| {
             let request = self
                 .agent
                 .post(&url)
                 .config()
                 .timeout_global(Some(timeout))
                 .build();
-            let (error, wait) = match send(request).and_then(|mut response| {
-                let status = response.status().as_u16();
-                Ok((status, response.body_mut().read_to_string()?))
-            }) {
-                Ok((200..300, body)) => {
-                    return serde_json::from_str::<Answer>(&body)
-                        .and_then(|answer| serde_json::from_value(answer.result))
-                        .map_err(Error::Unreadable);
-                }
-                Ok((code, body)) => {
-                    // A proxy in front of Telegram can answer with a page of its own.
-                    let answer: Answer = serde_json::from_str(&body).unwrap_or_default();
-                    let wait = retry_after(code, &answer, attempt);
-                    let error = Error::Rejected {
-                        code,
-                        description: answer.description.unwrap_or_default(),
-                    };
-                    (error, wait)
-                }
-                Err(error) => (
-                    // ureq quotes the URL back in some errors, and the token rides in it.
-                    Error::Transport(error.to_string().replace(&self.token, "***")),
-                    Some(backoff(attempt)),
-                ),
-            };
-            match wait {
-                Some(wait) if attempt < ATTEMPTS => {
-                    eprintln!("{method}: {error}, retrying in {wait:?}");
-                    std::thread::sleep(wait);
-                    attempt += 1;
-                }
-                _ => return Err(error),
+            let mut response = send(request).map_err(|error| self.transport(&error, attempt))?;
+            let status = response.status().as_u16();
+            let body = response
+                .body_mut()
+                .read_to_string()
+                .map_err(|error| self.transport(&error, attempt))?;
+            if !(200..300).contains(&status) {
+                return Err(rejection(status, &body, attempt));
             }
+            serde_json::from_str::<Answer>(&body)
+                .and_then(|answer| serde_json::from_value(answer.result))
+                .map_err(|error| (Error::Unreadable(error), None))
+        })
+    }
+
+    /// Saves the file at `file_path`, which `getFile` gave, as `to`. A local Bot API
+    /// server gives the absolute path of the file on its own filesystem, which is
+    /// copied, and Telegram gives a path to download.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] for a file that could not be copied or written, and otherwise as
+    /// [`Client::request`] does.
+    pub fn download(&self, file_path: &str, to: &Path) -> Result<(), Error> {
+        if Path::new(file_path).is_absolute() {
+            return fs::copy(file_path, to).map(drop).map_err(Error::Io);
+        }
+        let url = format!("{}/file/bot{}/{file_path}", self.base, self.token);
+        retried("download", |attempt| {
+            let mut response = self
+                .agent
+                .get(&url)
+                .config()
+                .timeout_global(Some(DOWNLOAD_TIMEOUT))
+                .build()
+                .call()
+                .map_err(|error| self.transport(&error, attempt))?;
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                let body = response.body_mut().read_to_string().unwrap_or_default();
+                return Err(rejection(status, &body, attempt));
+            }
+            let mut file = fs::File::create(to).map_err(|error| (Error::Io(error), None))?;
+            let mut reader = response.body_mut().as_reader();
+            let mut chunk = vec![0; 1 << 16];
+            loop {
+                let read = reader
+                    .read(&mut chunk)
+                    .map_err(|error| self.transport(&error, attempt))?;
+                if read == 0 {
+                    return Ok(());
+                }
+                file.write_all(&chunk[..read])
+                    .map_err(|error| (Error::Io(error), None))?;
+            }
+        })
+    }
+
+    /// A request or an answer that never made it across, worth asking again after a
+    /// backoff. ureq quotes the URL back in some errors, and the token rides in it.
+    fn transport(&self, error: &impl fmt::Display, attempt: u32) -> (Error, Option<Duration>) {
+        (
+            Error::Transport(error.to_string().replace(&self.token, "***")),
+            Some(backoff(attempt)),
+        )
+    }
+}
+
+/// Makes an attempt, numbered from 1, up to `ATTEMPTS` times while it fails with a
+/// wait to ask again after, and logs every failure it asks again after.
+fn retried<R>(
+    method: &str,
+    once: impl Fn(u32) -> Result<R, (Error, Option<Duration>)>,
+) -> Result<R, Error> {
+    let mut attempt = 1;
+    loop {
+        match once(attempt) {
+            Ok(result) => return Ok(result),
+            Err((error, Some(wait))) if attempt < ATTEMPTS => {
+                eprintln!("{method}: {error}, retrying in {wait:?}");
+                std::thread::sleep(wait);
+                attempt += 1;
+            }
+            Err((error, _)) => return Err(error),
         }
     }
+}
+
+/// A refusal with HTTP status `code` and the answer `body`, with the wait to ask again
+/// after where asking again can be answered differently.
+fn rejection(code: u16, body: &str, attempt: u32) -> (Error, Option<Duration>) {
+    // A proxy in front of Telegram can answer with a page of its own.
+    let answer: Answer = serde_json::from_str(body).unwrap_or_default();
+    let wait = retry_after(code, &answer, attempt);
+    let error = Error::Rejected {
+        code,
+        description: answer.description.unwrap_or_default(),
+    };
+    (error, wait)
 }
 
 /// Telegram's answer to a call, which on a rejection gives its reason and, for a burst,
@@ -270,6 +342,13 @@ pub struct Message {
     pub caption: Option<String>,
     #[serde(default)]
     pub caption_entities: Vec<Entity>,
+    /// The sizes Telegram scaled a photo to, smallest first.
+    #[serde(default)]
+    pub photo: Vec<PhotoSize>,
+    pub document: Option<Document>,
+    /// What every message of an album carries, since Telegram delivers each of its
+    /// files as a message of its own.
+    pub media_group_id: Option<String>,
     #[serde(rename = "reply_to_message")]
     pub replied: Option<Box<Message>>,
     #[serde(rename = "forum_topic_created")]
@@ -305,6 +384,28 @@ pub struct User {
     /// Whether the bot has a main Mini App, which only `getMe` tells.
     #[serde(default)]
     pub has_main_web_app: bool,
+}
+
+/// One size of a photo. `file_id` names its file to the bot that received it, and
+/// `file_unique_id` stays the same for every bot and every time the file is sent.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub file_unique_id: String,
+}
+
+/// A file sent as a file, under the name its sender gave it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Document {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_name: Option<String>,
+}
+
+/// What `getFile` gives for downloading a file with [`Client::download`].
+#[derive(Debug, Deserialize)]
+pub struct File {
+    pub file_path: Option<String>,
 }
 
 /// A span of formatting in a text or a caption, counted in UTF-16 code units.
@@ -409,13 +510,15 @@ mod tests {
     }
 
     /// A server that gives each connection the next of `answers`, a status and a body,
-    /// and counts them.
-    fn server(answers: &'static [(u16, &'static str)]) -> (String, std::thread::JoinHandle<usize>) {
-        use std::io::{Read, Write};
+    /// and returns the request line of each.
+    fn server(
+        answers: &'static [(u16, &'static str)],
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("an address"));
         let served = std::thread::spawn(move || {
-            for (count, (status, answer)) in answers.iter().enumerate() {
+            let mut lines = Vec::new();
+            for (status, answer) in answers {
                 let (mut stream, _) = listener.accept().expect("accept");
                 // Closing with part of the request unread resets the connection, so the
                 // whole request is read before the answer.
@@ -431,11 +534,10 @@ mod tests {
                     answer.len()
                 )
                 .expect("an answer");
-                if count + 1 == answers.len() {
-                    return answers.len();
-                }
+                let request = String::from_utf8_lossy(&request);
+                lines.push(request.lines().next().unwrap_or_default().to_owned());
             }
-            0
+            lines
         });
         (base, served)
     }
@@ -475,7 +577,7 @@ mod tests {
                 })
                 .expect("a result")
         );
-        assert_eq!(served.join().expect("the server"), 2);
+        assert_eq!(served.join().expect("the server").len(), 2);
     }
 
     #[test]
@@ -492,7 +594,7 @@ mod tests {
             })
             .expect_err("a rejection");
         assert!(matches!(error, Error::Rejected { code: 429, .. }));
-        assert_eq!(served.join().expect("the server"), 1);
+        assert_eq!(served.join().expect("the server").len(), 1);
     }
 
     #[test]
@@ -512,7 +614,7 @@ mod tests {
             error,
             Error::Rejected { code: 400, ref description } if description.contains("not found")
         ));
-        assert_eq!(served.join().expect("the server"), 1);
+        assert_eq!(served.join().expect("the server").len(), 1);
     }
 
     #[test]
@@ -530,7 +632,7 @@ mod tests {
                 })
                 .expect("a result")
         );
-        assert_eq!(served.join().expect("the server"), 2);
+        assert_eq!(served.join().expect("the server").len(), 2);
     }
 
     #[test]
@@ -541,7 +643,51 @@ mod tests {
             .send(&SendMessage::new(1, None, "hi"))
             .expect_err("an unreadable result");
         assert!(matches!(error, Error::Unreadable(_)));
-        assert_eq!(served.join().expect("the server"), 1);
+        assert_eq!(served.join().expect("the server").len(), 1);
+    }
+
+    #[test]
+    fn a_file_on_telegram_is_downloaded_and_one_on_a_local_server_copied() {
+        let directory = std::env::temp_dir().join(format!("kuriero-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("a directory");
+        let (base, served) = server(&[(200, "the photo")]);
+        let client = Client::new(&base, "123:secret");
+        let downloaded = directory.join("downloaded");
+        client
+            .download("photos/file_0.jpg", &downloaded)
+            .expect("a download");
+        assert_eq!(
+            served.join().expect("the server"),
+            ["GET /file/bot123:secret/photos/file_0.jpg HTTP/1.1"]
+        );
+        assert_eq!(
+            fs::read_to_string(&downloaded).expect("the file"),
+            "the photo"
+        );
+
+        let copied = directory.join("copied");
+        client
+            .download(downloaded.to_str().expect("a UTF-8 path"), &copied)
+            .expect("a copy");
+        assert_eq!(fs::read_to_string(&copied).expect("the file"), "the photo");
+        fs::remove_dir_all(&directory).expect("the directory removed");
+    }
+
+    #[test]
+    fn a_download_telegram_refuses_is_asked_once() {
+        let (base, served) = server(&[(
+            404,
+            r#"{"ok": false, "error_code": 404, "description": "Not Found"}"#,
+        )]);
+        let client = Client::new(&base, "123:secret");
+        let error = client
+            .download("photos/gone.jpg", Path::new("/nonexistent/gone.jpg"))
+            .expect_err("a rejection");
+        assert!(
+            matches!(error, Error::Rejected { code: 404, .. }),
+            "{error}"
+        );
+        assert_eq!(served.join().expect("the server").len(), 1);
     }
 
     #[test]

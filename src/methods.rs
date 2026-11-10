@@ -5,7 +5,7 @@ use std::ops::Not;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{ForumTopic, Keyboard, Sent, User};
+use crate::{File, ForumTopic, Keyboard, Sent, User};
 
 /// A body [`crate::Client::send`] posts as JSON to the method `NAME`.
 pub trait Method: Serialize {
@@ -32,6 +32,7 @@ method!(SetMessageReaction<'_>, "setMessageReaction", bool);
 method!(AnswerCallbackQuery<'_>, "answerCallbackQuery", bool);
 method!(SendChatAction, "sendChatAction", bool);
 method!(CreateForumTopic<'_>, "createForumTopic", ForumTopic);
+method!(GetFile<'_>, "getFile", File);
 
 #[derive(Serialize)]
 pub struct GetMe;
@@ -140,6 +141,11 @@ pub enum Content<'a> {
 pub struct CreateForumTopic<'a> {
     pub chat_id: i64,
     pub name: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct GetFile<'a> {
+    pub file_id: &'a str,
 }
 
 #[derive(Serialize)]
