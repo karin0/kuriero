@@ -302,6 +302,9 @@ pub struct User {
     pub first_name: String,
     pub last_name: Option<String>,
     pub username: Option<String>,
+    /// Whether the bot has a main Mini App, which only `getMe` tells.
+    #[serde(default)]
+    pub has_main_web_app: bool,
 }
 
 /// A span of formatting in a text or a caption, counted in UTF-16 code units.
