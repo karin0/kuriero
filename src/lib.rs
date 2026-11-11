@@ -415,6 +415,10 @@ pub struct Entity {
     pub kind: String,
     pub offset: usize,
     pub length: usize,
+    /// The address a `text_link` opens.
+    pub url: Option<String>,
+    /// The language a `pre` block names.
+    pub language: Option<String>,
 }
 
 /// The service message that opened a topic.
