@@ -373,6 +373,9 @@ impl Message {
 pub struct Chat {
     pub id: i64,
     pub title: Option<String>,
+    /// Whether the chat is a supergroup split into topics.
+    #[serde(default)]
+    pub is_forum: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -384,6 +387,9 @@ pub struct User {
     /// Whether the bot has a main Mini App, which only `getMe` tells.
     #[serde(default)]
     pub has_main_web_app: bool,
+    /// Whether the bot has topic mode on in its private chats, which only `getMe` tells.
+    #[serde(default)]
+    pub has_topics_enabled: bool,
 }
 
 /// One size of a photo. `file_id` names its file to the bot that received it, and

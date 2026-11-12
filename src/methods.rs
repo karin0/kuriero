@@ -5,7 +5,7 @@ use std::ops::Not;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{File, ForumTopic, Keyboard, Sent, User};
+use crate::{Chat, File, ForumTopic, Keyboard, Sent, User};
 
 /// A body [`crate::Client::send`] posts as JSON to the method `NAME`.
 pub trait Method: Serialize {
@@ -23,6 +23,7 @@ macro_rules! method {
 }
 
 method!(GetMe, "getMe", User);
+method!(GetChat, "getChat", Chat);
 method!(SetMyCommands<'_>, "setMyCommands", bool);
 method!(SendMessage<'_>, "sendMessage", Sent);
 method!(SendRichMessage<'_>, "sendRichMessage", Sent);
@@ -36,6 +37,12 @@ method!(GetFile<'_>, "getFile", File);
 
 #[derive(Serialize)]
 pub struct GetMe;
+
+/// Reads the full information on a chat, of which [`Chat`] keeps the fields it has.
+#[derive(Serialize)]
+pub struct GetChat {
+    pub chat_id: i64,
+}
 
 #[derive(Serialize)]
 pub struct SetMyCommands<'a> {
