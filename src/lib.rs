@@ -85,17 +85,12 @@ impl Client {
 
     /// One long poll for the messages and button presses since `offset`, which Telegram
     /// holds open for up to `timeout` seconds while nothing arrives. Each update is read
-    /// on its own, and `trace` logs it first as Telegram sent it.
+    /// on its own, after a trace-level log of it as Telegram sent it.
     ///
     /// # Errors
     ///
     /// Fails as [`Client::request`] does.
-    pub fn get_updates(
-        &self,
-        offset: i64,
-        timeout: u64,
-        trace: bool,
-    ) -> Result<Vec<Update>, Error> {
+    pub fn get_updates(&self, offset: i64, timeout: u64) -> Result<Vec<Update>, Error> {
         let body = serde_json::json!({
             "offset": offset,
             "timeout": timeout,
@@ -109,11 +104,9 @@ impl Client {
         Ok(updates
             .into_iter()
             .filter_map(|update| {
-                if trace {
-                    eprintln!("{update}");
-                }
+                log::trace!("{update}");
                 serde_json::from_value(update)
-                    .inspect_err(|error| eprintln!("update: {error}"))
+                    .inspect_err(|error| log::warn!("update: {error}"))
                     .ok()
             })
             .collect())
@@ -223,7 +216,7 @@ fn retried<R>(
         match once(attempt) {
             Ok(result) => return Ok(result),
             Err((error, Some(wait))) if attempt < ATTEMPTS => {
-                eprintln!("{method}: {error}, retrying in {wait:?}");
+                log::warn!("{method}: {error}, retrying in {wait:?}");
                 std::thread::sleep(wait);
                 attempt += 1;
             }
@@ -318,7 +311,7 @@ fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned>(
 ) -> Result<Option<T>, D::Error> {
     let value = Value::deserialize(deserializer)?;
     Ok(serde_json::from_value(value)
-        .inspect_err(|error| eprintln!("update: {error}"))
+        .inspect_err(|error| log::warn!("update: {error}"))
         .ok()
         .flatten())
 }
